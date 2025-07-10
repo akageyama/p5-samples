@@ -1,0 +1,349 @@
+/*
+     spring_nbody_simplified.p5 
+     
+     A sample code for the lecture "Basic Physics" 
+                    by A. Kageyama (Kobe Univ.)
+                    on 2025.05.23
+
+
+     質点系のシミュレーション サンプルプログラム
+     
+     
+     # プログラム
+        * オリジナルコードはProcessing言語で書いた sprinbg_nbody.pde
+        * そこから可視化機能を削除し、P5に変換した
+     
+     # 物理モデル
+        * x-y平面上での運動
+        * N個の質点が線形バネで引き合う
+        * バネの自然長は0
+        * 初期条件（質点の初期位置と初期速度）はランダムに与える
+        * ただし重心が原点にになるように調整している
+        * 全運動量も0になるように初期条件で調整している
+        * 粒子の質量は全て同じ
+        * 粒子毎に質量を変更することも可能にしているがテストはしていない
+
+     # シミュレーションモデル        
+        * 時間積分は4次精度のルンゲ・クッタ法
+        * 精度確認のため全エネルギーを1000ステップ毎に出力
+        * 全運動量（0のはず）と角運動量（z成分だけある）も出力
+
+     # 表示
+        * 質点は小さい円で表示。色はランダム
+        * 質点間を灰色の線で結ぶ
+
+     # 実行方法
+        * 開始: p5の画面の実行アイコン（三角）をクリック
+        * 停止: 停止アイコン（四角）をクリック
+        * キーボード操作はカーソルを右側の実行画面においてからすること
+          　　　　　　　　　　　　【左側のエディタ画面ではなく】
+          's'キー（またはマウスクリック）→ start / stop 
+          'r'キー → reset
+          'u'キー → 運動方程式の積分計算をスピードアップ
+          'd'キー → スピードダウン
+
+*/
+
+let time = 0.0;
+let step = 0;
+let dt = 0.01;
+let running_state_toggle = true;
+let x_coord_min = -5.0;
+let x_coord_max = 5.0;
+let y_coord_min = x_coord_min;
+let y_coord_max = x_coord_max;
+let vmax = 10.0;
+let vmin = -vmax;
+let PARTICLE_NUM = 3;
+let speed = 5;
+
+
+class GeneralCoords {
+  constructor(x = 0, y = 0, vx = 0, vy = 0) {
+    this.x = x;
+    this.y = y;
+    this.vx = vx;
+    this.vy = vy;
+  }
+}
+
+
+let part = [];
+let part_prev = [];
+let SPRING_K = 1.0;
+let STANDARD_PARTICLE_MASS = 1.0;
+
+
+class Particle {
+  constructor(mass = STANDARD_PARTICLE_MASS) {
+    this.mass = mass;
+    this.pos = new GeneralCoords();
+  }
+}
+
+
+let particleColors;
+
+function initialize_particles() {
+  let total_mx = 0; // 質量重みつきx座標の和（重心の計算に使う）
+  let total_my = 0; // 
+  let total_px = 0; // 全運動量のx成分
+  let total_py = 0; // 
+  let total_mass = 0; // 全質量
+
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    let x  = random(x_coord_min * 0.5, x_coord_max * 0.5);
+    let y  = random(y_coord_min * 0.5, y_coord_max * 0.5);
+    let vx = random(vmin * 0.6, vmax * 0.6);
+    let vy = random(vmin * 0.6, vmax * 0.6);
+    
+    part[i] = new Particle(STANDARD_PARTICLE_MASS);
+    part[i].pos = new GeneralCoords(x, y, vx, vy);
+    
+    let mass = part[i].mass;
+    total_mx += mass * x;
+    total_my += mass * y;
+    total_px += mass * vx;
+    total_py += mass * vy;
+    total_mass += mass;
+  }
+
+  let center_of_mass_x = total_mx / total_mass;
+  let center_of_mass_y = total_my / total_mass;
+  let px_mean = total_px / PARTICLE_NUM;
+  let py_mean = total_py / PARTICLE_NUM;
+ 
+
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    part[i].pos.x  -= center_of_mass_x;        // 重心を原点に平行移動
+    part[i].pos.y  -= center_of_mass_y;
+    part[i].pos.vx -= px_mean / part[i].mass;  // 全運動量を0にする
+    part[i].pos.vy -= py_mean / part[i].mass;
+    part_prev[i] = new Particle(STANDARD_PARTICLE_MASS);
+    part_prev[i].pos = new GeneralCoords(
+      part[i].pos.x,
+      part[i].pos.y,
+      part[i].pos.vx,
+      part[i].pos.vy
+    );
+  }
+}
+
+
+function setup() {
+  createCanvas(600, 600);
+  frameRate(60);
+  particleColors = [];
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    particleColors.push(color(random(100, 255), random(100, 255), random(100, 255)));
+  }
+  initialize_particles();
+  background(255);
+}
+
+
+function draw() {
+  if (running_state_toggle) {
+    for (let i = 0; i < speed; i++) {
+      rungeKutta4();
+      time += dt;
+      step++;
+      if (step % 1000 === 0) { 
+        calculateEnergies();  // エネルギーを出力
+        calculateMomentum();  // 運動量と角運動量を出力
+      }
+    }
+  }
+
+  background(255);
+  
+  
+  // 粒子間を灰色の線で結ぶ
+  stroke(200);  
+  strokeWeight(1);
+  
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    let xi = map(part[i].pos.x, x_coord_min, x_coord_max, 0, width);
+    let yi = map(part[i].pos.y, y_coord_min, y_coord_max, height, 0);
+    for (let j = i + 1; j < PARTICLE_NUM; j++) {
+      let xj = map(part[j].pos.x, x_coord_min, x_coord_max, 0, width);
+      let yj = map(part[j].pos.y, y_coord_min, y_coord_max, height, 0);
+      line(xi, yi, xj, yj);
+    }
+  }  
+
+  // 質点を円で描く
+  stroke(0); // 黒い線で円を描き、中はランダムな色で塗る
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    fill(particleColors[i]);
+    let px = map(part[i].pos.x, x_coord_min, x_coord_max, 0, width);
+    let py = map(part[i].pos.y, y_coord_min, y_coord_max, height, 0);
+    ellipse(px, py, 10, 10);
+  }
+}
+
+
+function rungeKutta4() {
+  let dp1 = [], dp2 = [], dp3 = [], dp4 = [], work = [];
+  
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    dp1[i]  = new Particle(part[i].mass);
+    dp2[i]  = new Particle(part[i].mass);
+    dp3[i]  = new Particle(part[i].mass);
+    dp4[i]  = new Particle(part[i].mass);
+    work[i] = new Particle(part[i].mass);
+  }
+
+  equation_of_motion(part_prev, dp1, dt);
+  rungekutta_advance(work, part_prev, dp1, 0.5);
+  equation_of_motion(work, dp2, dt);
+  rungekutta_advance(work, part_prev, dp2, 0.5);
+  equation_of_motion(work, dp3, dt);
+  rungekutta_advance(work, part_prev, dp3, 1.0);
+  equation_of_motion(work, dp4, dt);
+
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    let delta_x = 0, delta_y = 0, delta_vx = 0, delta_vy = 0;
+    
+    delta_x  += dp1[i].pos.x  / 6.0;
+    delta_x  += dp2[i].pos.x  / 3.0;
+    delta_x  += dp3[i].pos.x  / 3.0;
+    delta_x  += dp4[i].pos.x  / 6.0;
+    delta_y  += dp1[i].pos.y  / 6.0;
+    delta_y  += dp2[i].pos.y  / 3.0;
+    delta_y  += dp3[i].pos.y  / 3.0;
+    delta_y  += dp4[i].pos.y  / 6.0;
+    delta_vx += dp1[i].pos.vx / 6.0;
+    delta_vx += dp2[i].pos.vx / 3.0;
+    delta_vx += dp3[i].pos.vx / 3.0;
+    delta_vx += dp4[i].pos.vx / 6.0;
+    delta_vy += dp1[i].pos.vy / 6.0;
+    delta_vy += dp2[i].pos.vy / 3.0;
+    delta_vy += dp3[i].pos.vy / 3.0;
+    delta_vy += dp4[i].pos.vy / 6.0;
+    
+    part[i].pos.x   = part_prev[i].pos.x   + delta_x;
+    part[i].pos.y   = part_prev[i].pos.y   + delta_y;
+    part[i].pos.vx  = part_prev[i].pos.vx  + delta_vx;
+    part[i].pos.vy  = part_prev[i].pos.vy  + delta_vy;
+
+    part_prev[i].pos.x  = part[i].pos.x;
+    part_prev[i].pos.y  = part[i].pos.y;
+    part_prev[i].pos.vx = part[i].pos.vx;
+    part_prev[i].pos.vy = part[i].pos.vy;
+  }
+}
+
+
+function rungekutta_advance(target, source, dp, factor) {
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    target[i].pos.x  = source[i].pos.x  + factor * dp[i].pos.x;
+    target[i].pos.y  = source[i].pos.y  + factor * dp[i].pos.y;
+    target[i].pos.vx = source[i].pos.vx + factor * dp[i].pos.vx;
+    target[i].pos.vy = source[i].pos.vy + factor * dp[i].pos.vy;
+  }
+}
+
+
+/*
+    運動方程式
+*/
+function equation_of_motion(p, dp, dt) {
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    let xi  = p[i].pos.x;
+    let yi  = p[i].pos.y;
+    let vxi = p[i].pos.vx;
+    let vyi = p[i].pos.vy;
+
+    let sum_dx = 0;
+    let sum_dy = 0;
+    for (let j = 0; j < PARTICLE_NUM; j++) {
+      if (i === j) continue;
+      let dx = xi - p[j].pos.x;
+      let dy = yi - p[j].pos.y;
+      sum_dx += dx;
+      sum_dy += dy;
+    }
+    let kom = SPRING_K / p[i].mass;
+    dp[i].pos.x  = vxi * dt;
+    dp[i].pos.y  = vyi * dt;
+    dp[i].pos.vx = -kom * sum_dx * dt;
+    dp[i].pos.vy = -kom * sum_dy * dt;
+  }
+}
+
+
+/*
+    エネルギーの確認
+*/
+function calculateEnergies() {
+  let kinetic   = 0;
+  let potential = 0;
+
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    let vx = part[i].pos.vx;
+    let vy = part[i].pos.vy;
+    kinetic += 0.5 * part[i].mass * (vx * vx + vy * vy);
+  }
+
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    for (let j = i + 1; j < PARTICLE_NUM; j++) {
+      let dx = part[i].pos.x - part[j].pos.x;
+      let dy = part[i].pos.y - part[j].pos.y;
+      let r = sqrt(dx * dx + dy * dy);
+      potential += 0.5 * SPRING_K * pow(r, 2);
+    }
+  }
+
+  let total = kinetic + potential;
+  print(`Step ${step}: KE = ${kinetic.toFixed(5)}, PE = ${potential.toFixed(5)}, Total = ${total.toFixed(5)}`);
+}
+
+
+/*
+    運動量と角運動量の確認
+*/
+
+function calculateMomentum() {
+  let momentum_x = 0;
+  let momentum_y = 0;
+  let angular_momentum_z =  0;
+
+  for (let i = 0; i < PARTICLE_NUM; i++) {
+    let x  = part[i].pos.x;
+    let y  = part[i].pos.y;
+    let vx = part[i].pos.vx;
+    let vy = part[i].pos.vy;
+    let mass = part[i].mass;
+    momentum_x += mass * vx;
+    momentum_y += mass * vy;
+    angular_momentum_z += mass * ( x * vy - y * vx);
+  }
+
+  print(`Step ${step}: Px = ${momentum_x.toFixed(5)}, Py = ${momentum_y.toFixed(5)}, Lz = ${angular_momentum_z.toFixed(5)}`);
+}
+
+
+/*
+    キーボード操作
+ */
+function keyPressed() {
+  if (key === 's') running_state_toggle = !running_state_toggle;
+  if (key === 'u') speed *= 2;
+  if (key === 'd') speed = max(1, floor(speed / 10));
+  if (key === 'r') {
+    print(`Reset`);
+    background(255);
+    step = 0;
+    initialize_particles();
+  }
+}
+
+
+/*
+    マウス操作
+ */
+function mousePressed() {
+  running_state_toggle = !running_state_toggle;
+}
+
