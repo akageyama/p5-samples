@@ -338,8 +338,8 @@ function setup() {
     //
     //    // y軸上の自由落下。
     //    //     PARABOLA_FACTOR_A = 0.5 の場合、不安定 （H=1.5)
-    //    //     PARABOLA_FACTOR_A = 0.17 の場合、安定  （4*a*H > 1.0）
-    //    //     PARABOLA_FACTOR_A = 0.15 の場合、不安定 （4*a*H < 1.0）
+    //    //     PARABOLA_FACTOR_A = 0.17 の場合、不安定  （4*a*H > 1.0）
+    //    //     PARABOLA_FACTOR_A = 0.15 の場合、安定 （4*a*H < 1.0）
     //     ball = new GeneralCoords( 0.001, 0.0,  // x & vx
     //                               1.5, 0.0 ); // y & vy
     //
