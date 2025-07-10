@@ -1,0 +1,286 @@
+/*
+     double_pendulum.p5 
+     
+     A sample code for the lecture "Basic Physics" 
+                    by A. Kageyama (Kobe Univ.)
+                    on 2025.05.25
+
+
+     2重振り子のシミュレーション
+     
+     
+     # プログラム
+        * 初期条件（質点の初期位置と初期速度）は以下で設定
+            function initialize_double_pendulum() 
+        * 変数の意味
+            particle_pos[0]  // 質点1の角度 theta1
+            particle_pos[1]  // theta1の時間微分（theta1_dot）
+            particle_pos[2]  // 質点2の角度 theta2
+            particle_pos[3]  // theta2の時間微分 theta2_dot
+        
+     
+     # 物理モデル
+        * x-y平面上での2重振り子（下が+y方向）
+        * 上の質点を1番、下の質点を2番とする
+        * 棒の長さは1 (m)
+        * 二つの質点の質量は 1 (kg)
+        * 重力加速度は 9.8 (m^2/s) 
+        
+     # シミュレーションモデル        
+        * 時間積分は4次精度のルンゲ・クッタ法
+        * 精度確認のため全エネルギーを100ステップ毎に出力
+
+     # 表示
+        * 質点は小さい円で表示。
+        * 質点2の軌道を可視化するために航跡 (tail)を残す。
+
+     # 実行方法
+        * 開始: p5の画面の実行アイコン（三角）をクリック
+        * 停止: 停止アイコン（四角）をクリック
+        * カーソルを実行画面でクリックすると start / stop のトグル
+          't'キー → 航跡の表示 on / off もトグル 
+          'u'キー → 運動方程式の積分計算をスピードアップ
+          'd'キー → スピードダウン
+
+*/
+let time = 0.0;
+let step = 0;
+let dt = 0.001;
+
+let speed_factor = 20;
+
+let running_state_toggle = true;
+let draw_tail_toggle = true;
+
+let xmin = -2.2;
+let xmax =  2.2;
+let ymin = -2.2;
+let ymax =  2.2;
+
+let GRAVITY_ACCELERATION = 9.8;
+
+let particle_pos = [0, 0, 0, 0];
+
+const tail_npoints = 1000;
+let tail_x = new Array(tail_npoints);
+let tail_y = new Array(tail_npoints);
+
+function initialize_double_pendulum() {
+  particle_pos[0] = 1.0;  // 質点1の角度 theta1
+  particle_pos[1] = 2.0;  // theta1の時間微分（theta1_dot）
+  particle_pos[2] = 0.7;  // 質点2の角度 theta2
+  particle_pos[3] = 2.0;  // theta2の時間微分 theta2_dot
+}
+
+function initialize_tail() {
+  let theta1 = particle_pos[0];
+  let theta2 = particle_pos[2];
+
+  tail_x[0] = sin(theta1) + sin(theta2);
+  tail_y[0] = cos(theta1) + cos(theta2);
+  for (let i = 1; i < tail_npoints; i++) {
+    tail_x[i] = tail_x[0];
+    tail_y[i] = tail_y[0];
+  }
+}
+
+function setup() {
+  createCanvas(500, 500);
+  background(255);
+  initialize_double_pendulum();
+  initialize_tail();
+  frameRate(60);
+}
+
+function mapx(x) {
+  let scale = width / (xmax - xmin);
+  return map(x, xmin, xmax, scale * xmin, scale * xmax);
+}
+
+function mapy(y) {
+  let scale = height / (ymax - ymin);
+  return map(y, ymin, ymax, scale * ymin, scale * ymax);
+}
+
+function draw_text() {
+  stroke(0)
+  text("Click to start/stop", mapx(xmax * 0.5), mapy(ymin * 0.8));
+  text("Type u to speed up", mapx(xmax * 0.5), mapy(ymin * 0.7));
+  text("Type d speed down", mapx(xmax * 0.5), mapy(ymin * 0.65));
+  text("Type t toggle tail", mapx(xmax * 0.5), mapy(ymin * 0.60));
+}
+
+function draw_double_pendulum(theta1, theta2) {
+  let x1 = sin(theta1);
+  let y1 = cos(theta1);
+  let x2 = x1 + sin(theta2);
+  let y2 = y1 + cos(theta2);
+
+  stroke(0, 0, 100);
+  strokeWeight(1);
+  line(mapx(0), mapy(0), mapx(x1), mapy(y1));
+  line(mapx(x1), mapy(y1), mapx(x2), mapy(y2));
+
+  stroke(0);
+  strokeWeight(1);
+  fill(210, 98, 76);
+  ellipse(mapx(x1), mapy(y1), 10, 10);
+
+  fill(110, 110, 200);
+  ellipse(mapx(x2), mapy(y2), 10, 10);
+}
+
+function update_tail() {
+  for (let i = tail_npoints - 1; i >= 1; i--) {
+    tail_x[i] = tail_x[i - 1];
+    tail_y[i] = tail_y[i - 1];
+  }
+
+  let theta1 = particle_pos[0];
+  let theta2 = particle_pos[2];
+
+  tail_x[0] = sin(theta1) + sin(theta2);
+  tail_y[0] = cos(theta1) + cos(theta2);
+}
+
+function draw_tail() {
+  let tail_color_gray_max = 50.0;
+  let delta = tail_color_gray_max / tail_npoints;
+  let x0 = tail_x[0];
+  let y0 = tail_y[0];
+  for (let i = 1; i < tail_npoints; i++) {
+    let x1 = tail_x[i];
+    let y1 = tail_y[i];
+    stroke(255 - (tail_npoints - i) * delta);
+    line(mapx(x0), mapy(y0), mapx(x1), mapy(y1));
+    x0 = x1;
+    y0 = y1;
+  }
+}
+
+function total_energy() {
+    // particle 1 position 
+    //    x1 = sin(theta1)
+    //    y1 = cos(theta1)
+    // particle 2 position
+    //    x2 = x1 + sin(theta2) = sin(theta1) + sin(theta2)
+    //    y2 = y2 + cos(theta2) = cos(theta1) + cos(theta2)
+    // particle 1 velocity
+    //    v1x =  cos(theta1) * theta1_dot
+    //    v1y = -sin(theta1) * theta1_dot
+    //    v1_sq = v1x*v1x + v11*v1y
+    // particle 2 velocity
+    //    v2x =  cos(theta1) * theta1_dot + cos(theta2) * theta2_dot
+    //    v2y = -sin(theta1) * theta1_dot - sin(theta2) * theta2_dot
+    //    v2_sq = v1x*v1x + v11*v1y  
+
+  let [theta1, theta1_dot, theta2, theta2_dot] = particle_pos;
+
+  let v2x = cos(theta1) * theta1_dot + cos(theta2) * theta2_dot;
+  let v2y = -sin(theta1) * theta1_dot - sin(theta2) * theta2_dot;
+
+  let kinetic_e = 0.5 * theta1_dot * theta1_dot + 0.5 * (v2x * v2x + v2y * v2y);
+  let potential = -GRAVITY_ACCELERATION * (2 * cos(theta1) + cos(theta2));
+
+  return kinetic_e + potential;
+}
+
+function runge_kutta4_advance(p, p1, dp, factor) {
+  for (let i = 0; i < 4; i++) {
+    p[i] = p1[i] + factor * dp[i];
+  }
+}
+
+function equation_of_motion(pos, dpos, dt) {
+  //  Kinetic energy 
+  //      K = (1/2) * ( theta1_dot )^2
+  //        + (1/2) * ( cos(theta1) * theta1_dot 
+  //                  + cos(theta2) * theta2_dot )^2
+  //        + (1/2) * ( sin(theta1) * theta1_dot 
+  //                  + sin(theta2) * theta2_dot )^2
+  //  Potential 
+  //      U = - g * ( 2*cos(theta1) + cos(theta2) )  
+  // 
+  //  Lagrangian 
+  //       L(theta1,theta2,theta1_dot,theta2_dot) = K - U
+  //  
+  let [theta1, theta1_dot, theta2, theta2_dot] = pos;
+
+  let sin12 = sin(theta1 - theta2);
+  let cos12 = cos(theta1 - theta2);
+  let factor = 1.0 / (2.0 - cos12 * cos12);
+
+  let r1 = 2 * GRAVITY_ACCELERATION * sin(theta1) + sin12 * theta2_dot * theta2_dot;
+  let r2 = -sin12 * theta1_dot * theta1_dot + GRAVITY_ACCELERATION * sin(theta2);
+
+  dpos[0] = theta1_dot * dt;
+  dpos[1] = factor * (-1.0 * r1 + cos12 * r2) * dt;
+  dpos[2] = theta2_dot * dt;
+  dpos[3] = factor * (cos12 * r1 - 2.0 * r2) * dt;
+}
+
+function runge_kutta4() {
+  let pos_before = [...particle_pos];
+  let work_pos = new Array(4);
+  let dpos1 = new Array(4);
+  let dpos2 = new Array(4);
+  let dpos3 = new Array(4);
+  let dpos4 = new Array(4);
+
+  equation_of_motion(pos_before, dpos1, dt);
+  runge_kutta4_advance(work_pos, pos_before, dpos1, 0.5);
+  equation_of_motion(work_pos, dpos2, dt);
+  runge_kutta4_advance(work_pos, pos_before, dpos2, 0.5);
+  equation_of_motion(work_pos, dpos3, dt);
+  runge_kutta4_advance(work_pos, pos_before, dpos3, 1.0);
+  equation_of_motion(work_pos, dpos4, dt);
+
+  for (let i = 0; i < 4; i++) {
+    particle_pos[i] =
+      pos_before[i] +
+      (1.0 / 6.0) * dpos1[i] +
+      (1.0 / 3.0) * dpos2[i] +
+      (1.0 / 3.0) * dpos3[i] +
+      (1.0 / 6.0) * dpos4[i];
+  }
+}
+
+function draw() {
+  background(255);
+  translate(width / 2, height / 2);
+
+  if (running_state_toggle) {
+    for (let i = 0; i < speed_factor; i++) {
+      runge_kutta4();
+      time += dt;
+      step++;
+      if (step % 100 === 0) {
+        console.log(`step = ${step}, time = ${time}, energy = ${total_energy()}`);
+      }
+      update_tail();
+    }
+  }
+
+  let theta1 = particle_pos[0];
+  let theta2 = particle_pos[2];
+
+  if (draw_tail_toggle) draw_tail();
+  draw_double_pendulum(theta1, theta2);
+  draw_text();
+}
+
+function mousePressed() {
+  running_state_toggle = !running_state_toggle;
+}
+
+function keyReleased() {
+  if (key === 'u') {
+    speed_factor *= 2;
+  } else if (key === 'd') {
+    speed_factor = max(1, speed_factor / 2);
+  }
+  if (key === 't') {
+    draw_tail_toggle = !draw_tail_toggle;
+  }
+}
+
