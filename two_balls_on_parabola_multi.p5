@@ -104,7 +104,7 @@ class Windowz {
             this.xmin,
             this.ymin,
             this.xmax - this.xmin,
-            this.ymax - this.xmin
+            this.ymax - this.ymin
         );
     }
 
@@ -499,7 +499,7 @@ function parabola_func_lower(x) {
 
 function parabola_func_lower_derivative(x) {
     // When you change this, revise
-    // parabola_func_upper(), too.
+    // parabola_func_lower(), too.
     let y = -2 * x;
     return y;
 }
