@@ -1,0 +1,304 @@
+/*
+       Original code earth_and_moon.pde (Processing) by Akira Kageyama, on 2026.05.15
+
+  Original comment
+
+      ↓===========<ここから>===========↓
+  
+         earth_and_moon.pde
+ 
+         A simulation program for the tidal force.
+      
+            Gravitationally interacting two objects, earth and moon.
+            Each object is modeled by spring-damper annulus.
+                   
+       ----
+       
+         地球と月を円環状の2次元物体としてモデル化している。
+         円環はバネ=質点系。バネにはダンパーがある。これがエネルギーを散逸させる。
+         地球を構成する粒子と月を構成する粒子どうしが相互作用する。同じ天体内部での粒子の引力はない。
+         等角速度で回転する系で解く。（つまりコリオリ力と遠心力を運動方程式に入れている。）
+     
+         簡単なシミュレーションだが、いくつか注意がある。
+         
+           初期条件は、二つの天体のそれぞれの重心（円環の中心）が重力で公転する円軌道を設定。
+           シミュレーション開始後に潮汐力で円環が変形する。
+           この変形により重心がわずかに落下する。つまり地球と月の重心が近づく。
+           そのために公転運動の角速度がわずかに上昇する。
+           当初は回転系の角速度を初期条件における完全な円環の重心同士の円軌道で設定していた。
+           だがそうすると上述の「円環の変形による重心の落下」により、地球と月が反時計方向に回転するように見える。
+           この落下は半径方向の振動を引き起こす（これは慣性系でもそう見えるリアルな現象である）
+           落下の際に重心の軌道がコリオリ力のせいで右に曲がるのでこの振動は複雑な軌道になる
+           このややこしい現象をできるだけ目立たないようにするために初期条件の円環の重心を落下を想定してわずかに内側に置いている。
+           そのパラメータ correction_factor_for_doformation_of_planets は試行錯誤で決めた。
+           
+           
+      - by Akira Kageyama (kage@port.kobe-u.ac.jp)
+      - on 2026.05.15 
+
+      ↑===========<ここまで>===========↑
+
+*/
+
+const G=100.0;
+let Kspring;
+const K_INITIAL=6.0e3, K_FINAL=6.0e3, K_CHANGE_TIME=0.0;
+const N=20, DAMPER=50.0;
+const VM=50, HM=5;
+let Omega, time=0, step=0, dt=1e-4, running=true, speed=200;
+const xmin=-2, xmax=2;
+let earth, moon, win;
+
+class DV{constructor(x=0,y=0){this.x=x;this.y=y;}}
+class GC{constructor(x=0,y=0,vx=0,vy=0){this.x=x;this.y=y;this.vx=vx;this.vy=vy;} copy(){return new GC(this.x,this.y,this.vx,this.vy);}}
+class Log{
+  constructor(){this.SIZE=300;this.x=Array(this.SIZE).fill(0);this.y=Array(this.SIZE).fill(0);this.n=0;}
+  save(x,y){for(let i=this.n;i>0;i--){this.x[i]=this.x[i-1];this.y[i]=this.y[i-1];}this.x[0]=x;this.y[0]=y;if(this.n<this.SIZE-1)this.n++;}
+}
+function hypot2(x,y){return Math.sqrt(x*x+y*y);}
+function sq(x){return x*x;}
+
+class Annulus{
+  constructor(ri,ro,cx,cy,cvx,cvy,L,totalMass){
+    this.ri=ri;this.ro=ro;this.m=totalMass/(2*N);
+    this.ip=Array(N);this.op=Array(N);this.iv=Array(N);this.ov=Array(N);
+    this.sfI=Array(N);this.sfO=Array(N);
+    this.sii=Array(N);this.sio=Array(N);this.soi=Array(N);this.soo=Array(N);
+    this.lii=Array(N);this.lio=Array(N);this.loi=Array(N);this.loo=Array(N);
+    const omega=L/((totalMass/2)*(ri*ri+ro*ro));
+    console.log("spin omega =",omega);
+    for(let j=0;j<N;j++){
+      let ph=TWO_PI*j/N;
+      this.ip[j]=new DV(cx+ri*Math.cos(ph),cy+ri*Math.sin(ph));
+      this.iv[j]=new DV(cvx-ri*omega*Math.sin(ph),cvy+ri*omega*Math.cos(ph));
+      ph=TWO_PI*(j+0.5)/N;
+      this.op[j]=new DV(cx+ro*Math.cos(ph),cy+ro*Math.sin(ph));
+      this.ov[j]=new DV(cvx-ro*omega*Math.sin(ph),cvy+ro*omega*Math.cos(ph));
+    }
+    this.updateSpringVectors();this.setNaturalLengths();this.updateSprings();this.updateCenter();
+  }
+  updateSpringVectors(){
+    for(let j=0;j<N;j++){
+      const jp=(j+1)%N;
+      this.sii[j]=new GC(this.ip[jp].x-this.ip[j].x,this.ip[jp].y-this.ip[j].y,this.iv[jp].x-this.iv[j].x,this.iv[jp].y-this.iv[j].y);
+      this.sio[j]=new GC(this.op[j].x-this.ip[j].x,this.op[j].y-this.ip[j].y,this.ov[j].x-this.iv[j].x,this.ov[j].y-this.iv[j].y);
+      this.soi[j]=new GC(this.ip[jp].x-this.op[j].x,this.ip[jp].y-this.op[j].y,this.iv[jp].x-this.ov[j].x,this.iv[jp].y-this.ov[j].y);
+      this.soo[j]=new GC(this.op[jp].x-this.op[j].x,this.op[jp].y-this.op[j].y,this.ov[jp].x-this.ov[j].x,this.ov[jp].y-this.ov[j].y);
+    }
+  }
+  setNaturalLengths(){
+    for(let j=0;j<N;j++){
+      this.lii[j]=hypot2(this.sii[j].x,this.sii[j].y);
+      this.lio[j]=hypot2(this.sio[j].x,this.sio[j].y);
+      this.loi[j]=hypot2(this.soi[j].x,this.soi[j].y);
+      this.loo[j]=hypot2(this.soo[j].x,this.soo[j].y);
+    }
+  }
+  addSpring(s,L,fa,fb){
+    const len=hypot2(s.x,s.y); if(len<1e-12)return;
+    const nx=s.x/len, ny=s.y/len;
+    const ext=len-L;
+    const vrel=s.vx*nx+s.vy*ny;
+    const amp=Kspring*ext + DAMPER*vrel;
+    const fx=amp*nx, fy=amp*ny;
+    fa.x+=fx;fa.y+=fy;fb.x-=fx;fb.y-=fy;
+  }
+  updateSprings(){
+    this.updateSpringVectors();
+    for(let j=0;j<N;j++){this.sfI[j]=new DV(0,0);this.sfO[j]=new DV(0,0);}
+    for(let j=0;j<N;j++){
+      const jp=(j+1)%N;
+      this.addSpring(this.sii[j],this.lii[j],this.sfI[j],this.sfI[jp]);
+      this.addSpring(this.sio[j],this.lio[j],this.sfI[j],this.sfO[j]);
+      this.addSpring(this.soi[j],this.loi[j],this.sfO[j],this.sfI[jp]);
+      this.addSpring(this.soo[j],this.loo[j],this.sfO[j],this.sfO[jp]);
+    }
+  }
+  setPosVel(from,to,pv){
+    for(let i=from;i<to;i++){
+      const ii=i-from;
+      if(ii<N){this.ip[ii].x=pv[i].x;this.ip[ii].y=pv[i].y;this.iv[ii].x=pv[i].vx;this.iv[ii].y=pv[i].vy;}
+      else{const j=ii-N;this.op[j].x=pv[i].x;this.op[j].y=pv[i].y;this.ov[j].x=pv[i].vx;this.ov[j].y=pv[i].vy;}
+    }
+  }
+  updateCenter(){
+    let sx=0,sy=0,svx=0,svy=0;
+    for(let j=0;j<N;j++){sx+=this.ip[j].x+this.op[j].x;sy+=this.ip[j].y+this.op[j].y;svx+=this.iv[j].x+this.ov[j].x;svy+=this.iv[j].y+this.ov[j].y;}
+    this.cx=sx/(2*N);this.cy=sy/(2*N);this.cvx=svx/(2*N);this.cvy=svy/(2*N);
+  }
+  kinetic(){
+    let sum=0,om=Omega;
+    for(let j=0;j<N;j++){
+      let vx=this.iv[j].x-om*this.ip[j].y, vy=this.iv[j].y+om*this.ip[j].x; sum+=vx*vx+vy*vy;
+      vx=this.ov[j].x-om*this.op[j].y; vy=this.ov[j].y+om*this.op[j].x; sum+=vx*vx+vy*vy;
+    }
+    return 0.5*this.m*sum;
+  }
+  springEnergy(){
+    let sum=0;
+    for(let j=0;j<N;j++){
+      sum+=sq(hypot2(this.sii[j].x,this.sii[j].y)-this.lii[j]);
+      sum+=sq(hypot2(this.sio[j].x,this.sio[j].y)-this.lio[j]);
+      sum+=sq(hypot2(this.soi[j].x,this.soi[j].y)-this.loi[j]);
+      sum+=sq(hypot2(this.soo[j].x,this.soo[j].y)-this.loo[j]);
+    }
+    return 0.5*Kspring*sum;
+  }
+  energy(){return this.kinetic()+this.springEnergy();}
+}
+class Planet{
+  constructor(M,ro,ratio,cx,cy,cvx,cvy,L,col){
+    this.mass=M;this.col=col;this.log=new Log();
+    this.ann=new Annulus(ro*ratio,ro,cx,cy,cvx,cvy,L,M);
+  }
+  energy(){return this.ann.energy();}
+  saveCOM(){this.ann.updateCenter();this.log.save(this.ann.cx,this.ann.cy);}
+  Lz(){
+    let sum=0,om=Omega,a=this.ann;
+    for(let j=0;j<N;j++){
+      let x=a.ip[j].x,y=a.ip[j].y; sum+=x*a.iv[j].y-y*a.iv[j].x+(x*x+y*y)*om;
+      x=a.op[j].x;y=a.op[j].y; sum+=x*a.ov[j].y-y*a.ov[j].x+(x*x+y*y)*om;
+    }
+    return a.m*sum;
+  }
+  drawTrail(){
+    push();win.origin();
+    for(let i=1;i<this.log.n;i++){let age=i/this.log.n;stroke(128+age*127);line(win.mx(this.log.x[i-1]),win.my(this.log.y[i-1]),win.mx(this.log.x[i]),win.my(this.log.y[i]));}
+    pop();
+  }
+  draw(){
+    push();win.origin();stroke(190);strokeWeight(1);
+    const a=this.ann;
+    for(let j=0;j<N;j++){
+      const jp=(j+1)%N;
+      line(win.mx(a.ip[j].x),win.my(a.ip[j].y),win.mx(a.ip[jp].x),win.my(a.ip[jp].y)); // II
+      line(win.mx(a.ip[j].x),win.my(a.ip[j].y),win.mx(a.op[j].x),win.my(a.op[j].y));   // IO
+      line(win.mx(a.op[j].x),win.my(a.op[j].y),win.mx(a.ip[jp].x),win.my(a.ip[jp].y)); // OI
+      line(win.mx(a.op[j].x),win.my(a.op[j].y),win.mx(a.op[jp].x),win.my(a.op[jp].y)); // OO
+    }
+    noStroke();fill(this.col);
+    for(let j=0;j<N;j++){circle(win.mx(a.ip[j].x),win.my(a.ip[j].y),5);circle(win.mx(a.op[j].x),win.my(a.op[j].y),5);}
+    pop();
+  }
+}
+class WindowPanel{
+  constructor(x0,y0,x1,y1){this.x0=x0;this.y0=y0;this.x1=x1;this.y1=y1;this.wx=0.5;this.wy=0.5;}
+  bg(){noStroke();fill(255,255,240);rect(this.x0,this.y0,this.x1-this.x0,this.y1-this.y0);}
+  origin(){translate(this.wx*this.x0+(1-this.wx)*this.x1,this.wy*this.y0+(1-this.wy)*this.y1);}
+  mx(x){return x*(this.x1-this.x0)/(xmax-xmin);}
+  my(y){return -y*(this.x1-this.x0)/(xmax-xmin);}
+  axes(){push();this.origin();stroke(100);line(this.mx(xmin),0,this.mx(xmax),0);line(0,this.mx(xmin),0,this.mx(xmax));pop();}
+  labels(){push();this.origin();fill(0);noStroke();textAlign(RIGHT);text("x",this.mx(xmax),-6);textAlign(CENTER);text("y",0,-this.mx(xmax)-6);pop();}
+}
+function setup(){
+  const cnv=createCanvas(450,500); cnv.parent(document.querySelector("main"));
+  frameRate(60);textSize(14);
+  win=new WindowPanel(HM,VM,width-HM,height-VM);
+  Kspring=K_INITIAL;
+  const eM=1, phase=0, massRatio=1;
+  const eRo=xmax*0.25, aspect=0.9, eOrbit=xmax*0.5;
+  const corr=0.97, rrr=Math.pow(corr*eOrbit,3), beta=massRatio*(1+massRatio)*(1+massRatio);
+  Omega=Math.sqrt(G*eM/(beta*rrr)); console.log("orbit omega =",Omega);
+  const spinFactor=0.1;
+  const eSpin=spinFactor*eM*Omega*eOrbit*eOrbit;
+  const mM=eM/massRatio, mRo=eRo/massRatio, mOrbit=eOrbit*massRatio;
+  earth=new Planet(eM,eRo,aspect,eOrbit*Math.cos(phase),eOrbit*Math.sin(phase),0,0,eSpin,color(0,32,255));
+  moon =new Planet(mM,mRo,aspect,-mOrbit*Math.cos(phase),-mOrbit*Math.sin(phase),0,0,eSpin,color(255,160,16));
+  setDt();
+}
+function setDt(){
+  const we=Math.sqrt(Kspring/earth.ann.m), wm=Math.sqrt(Kspring/moon.ann.m);
+  dt=Math.min((TWO_PI/we)*0.005,(TWO_PI/wm)*0.005);
+}
+function changeK(){
+  const rem=K_CHANGE_TIME-time;
+  if(rem>0){const f=rem/K_CHANGE_TIME;Kspring=K_FINAL+(K_INITIAL-K_FINAL)*f;}
+}
+function gather(){
+  const p=[];
+  for(let a of [earth.ann,moon.ann]){
+    for(let j=0;j<N;j++)p.push(new GC(a.ip[j].x,a.ip[j].y,a.iv[j].x,a.iv[j].y));
+    for(let j=0;j<N;j++)p.push(new GC(a.op[j].x,a.op[j].y,a.ov[j].x,a.ov[j].y));
+  }
+  return p;
+}
+function scatter(p){
+  let c=0;
+  for(let a of [earth.ann,moon.ann]){
+    for(let j=0;j<N;j++,c++){a.ip[j].x=p[c].x;a.ip[j].y=p[c].y;a.iv[j].x=p[c].vx;a.iv[j].y=p[c].vy;}
+    for(let j=0;j<N;j++,c++){a.op[j].x=p[c].x;a.op[j].y=p[c].y;a.ov[j].x=p[c].vx;a.ov[j].y=p[c].vy;}
+    a.updateSprings();a.updateCenter();
+  }
+}
+function rhs(nE,nAll,dtl,p,dp){
+  earth.ann.setPosVel(0,nE,p); earth.ann.updateSprings(); earth.ann.updateCenter();
+  moon.ann.setPosVel(nE,nAll,p); moon.ann.updateSprings(); moon.ann.updateCenter();
+  const nM=nAll-nE;
+  for(let i=0;i<nAll;i++){
+    let a, otherM, sfx, sfy;
+    if(i<nE){a=earth.ann;otherM=moon.ann.m;if(i<N){sfx=a.sfI[i].x;sfy=a.sfI[i].y;}else{sfx=a.sfO[i-N].x;sfy=a.sfO[i-N].y;}}
+    else{a=moon.ann;otherM=earth.ann.m;let q=i-nE;if(q<N){sfx=a.sfI[q].x;sfy=a.sfI[q].y;}else{sfx=a.sfO[q-N].x;sfy=a.sfO[q-N].y;}}
+    const m=a.m,x=p[i].x,y=p[i].y,vx=p[i].vx,vy=p[i].vy;
+    let gfx=0,gfy=0;
+    if(i<nE){
+      for(let k=nE;k<nAll;k++){const dx=p[k].x-x,dy=p[k].y-y,r=hypot2(dx,dy),r3=r*r*r;gfx+=dx/r3;gfy+=dy/r3;}
+    }else{
+      for(let k=0;k<nE;k++){const dx=p[k].x-x,dy=p[k].y-y,r=hypot2(dx,dy),r3=r*r*r;gfx+=dx/r3;gfy+=dy/r3;}
+    }
+    gfx*=G*otherM*m; gfy*=G*otherM*m;
+    const om=Omega,om2=om*om;
+    const cx= 2*m*vy*om, cy=-2*m*vx*om;
+    const fx=gfx+sfx+cx+m*x*om2, fy=gfy+sfy+cy+m*y*om2;
+    dp[i].x=vx*dtl; dp[i].y=vy*dtl; dp[i].vx=fx*dtl/m; dp[i].vy=fy*dtl/m;
+  }
+}
+function adv(n,b,b1,db,f){for(let i=0;i<n;i++){b[i].x=b1[i].x+f*db[i].x;b[i].y=b1[i].y+f*db[i].y;b[i].vx=b1[i].vx+f*db[i].vx;b[i].vy=b1[i].vy+f*db[i].vy;}}
+function rk4(p){
+  const n=p.length,nE=2*N,old=p.map(q=>q.copy());
+  const work=Array.from({length:n},()=>new GC());
+  const k1=Array.from({length:n},()=>new GC()),k2=Array.from({length:n},()=>new GC()),k3=Array.from({length:n},()=>new GC()),k4=Array.from({length:n},()=>new GC());
+  rhs(nE,n,dt,old,k1); adv(n,work,old,k1,0.5);
+  rhs(nE,n,dt,work,k2); adv(n,work,old,k2,0.5);
+  rhs(nE,n,dt,work,k3); adv(n,work,old,k3,1.0);
+  rhs(nE,n,dt,work,k4);
+  for(let i=0;i<n;i++){
+    p[i].x=old[i].x+(k1[i].x+2*k2[i].x+2*k3[i].x+k4[i].x)/6;
+    p[i].y=old[i].y+(k1[i].y+2*k2[i].y+2*k3[i].y+k4[i].y)/6;
+    p[i].vx=old[i].vx+(k1[i].vx+2*k2[i].vx+2*k3[i].vx+k4[i].vx)/6;
+    p[i].vy=old[i].vy+(k1[i].vy+2*k2[i].vy+2*k3[i].vy+k4[i].vy)/6;
+  }
+}
+function integrate(){
+  const p=gather(); rk4(p); scatter(p);
+  if(step%1000===0){earth.saveCOM();moon.saveCOM();}
+}
+function totalEnergy(){
+  let sum=earth.energy()+moon.energy();
+  const em=earth.ann.m, mm=moon.ann.m;
+  let gp=0;
+  for(let j=0;j<N;j++)for(let k=0;k<N;k++){
+    for(let pair of [[earth.ann.ip[j],moon.ann.ip[k]],[earth.ann.ip[j],moon.ann.op[k]],[earth.ann.op[j],moon.ann.ip[k]],[earth.ann.op[j],moon.ann.op[k]]]){
+      const dx=pair[0].x-pair[1].x,dy=pair[0].y-pair[1].y; gp-=1/hypot2(dx,dy);
+    }
+  }
+  return sum+gp*G*em*mm;
+}
+function draw(){
+  if(running){for(let i=0;i<speed;i++){integrate();time+=dt;step++;}changeK();setDt();}
+  win.bg();win.labels();win.axes();
+  earth.drawTrail();moon.drawTrail();earth.draw();moon.draw();
+  fill(0);noStroke();textAlign(CENTER,CENTER);
+  text("Tidal force simulation: two-ring annulus model\nClick or s: start/stop   u/d: speed up/down",width/2,VM/2);
+  fill(255);noStroke();rect(0,height-VM,width,VM);
+  fill(0);textAlign(CENTER,TOP);
+  text("t = "+nf(time,6,3)+"   step = "+step+"   speed = "+speed+
+       "\nenergy = "+totalEnergy().toExponential(5)+"   angular momentum = "+(earth.Lz()+moon.Lz()).toExponential(5)+"   k = "+Kspring.toExponential(3),
+       width/2,height-VM+5);
+}
+function mousePressed(){running=!running;}
+function keyReleased(){
+  if(key==='s'||key==='S')running=!running;
+  else if(key==='u'||key==='U')speed*=10;
+  else if(key==='d'||key==='D'){speed=Math.floor(speed/10);if(speed<1)speed=1;}
+}
+
