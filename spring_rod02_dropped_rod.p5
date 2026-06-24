@@ -1,0 +1,1558 @@
+/*  
+ 
+  spring_rod_dropped_rod.pde
+ 
+    * 重力下向き
+    * 床を設定。
+    * rodを床に落とす。
+    * 散逸なしの場合も完全弾性反射はしない。ポテンシャルエネルギーの一部が内部の「熱運動」に移るため。
+    
+    
+    2026.06.26  kage@port.kobe-u.ac.jp
+ 
+ Usage:
+ - Type u/d to speed up/down.
+ - Type s to toggle start/stop.
+ - Or mouse click to toggle start/stop. 
+ 
+ */
+
+//
+//   Window/visualization related params
+//
+const VERTICAL_MARGIN = 50;
+const HORIZONTAL_MARGIN = 5;
+let x_coord_min = -2.0;
+let x_coord_max =  2.0;
+let play_speed = 200;
+
+//
+//   Simulation job params
+//
+let simulation_time = 0.0;
+let simulation_step = 0;
+let simulation_dt;
+let running_state_toggle = true;
+
+const NUM_RODS = 1;
+
+//
+//   Physics related params
+//
+//const SPRING_DAMPER_FACTOR = 10;
+const SPRING_DAMPER_FACTOR = 0;
+const GRAVITY_ACCELERATION = 9.8;
+const FLOOR_LEVEL_Y = -1.0;
+
+
+class DVector {
+  constructor(x = 0, y = 0) {
+    this.x = x;
+    this.y = y;
+  }
+}
+
+
+class GeneralCoords {
+  constructor(x = 0, y = 0, vx = 0, vy = 0) {
+    if (x instanceof GeneralCoords) {
+      const copy = x;
+      this.x  = copy.x;
+      this.y  = copy.y;
+      this.vx = copy.vx;
+      this.vy = copy.vy;
+    } else {
+      this.x  = x;
+      this.y  = y;
+      this.vx = vx;
+      this.vy = vy;
+    }
+  }
+}
+
+
+let floor;
+
+class Floor {
+  constructor(level_y) {
+    this.level_y = level_y;
+  }
+  
+  /*
+                        
+                   .             .
+                                /
+               .               /      .
+                      radius  /
+             .               /          .
+                            /
+            .              /             .
+                          *
+            .                            .
+            
+             .                          .
+             
+               .                      .
+            ---------------------------------       level_y
+                   .             .
+                       .     .
+  */
+  
+  calc_potential_energy(particle_pos_y,
+                        particle_radius,
+                        particle_spring_const_k) {
+    let potential = 0;
+    let distance_between_particle_center_and_floor =
+      particle_pos_y - this.level_y;
+     
+    if (distance_between_particle_center_and_floor < particle_radius) {
+      let shrink_length =
+        particle_radius - distance_between_particle_center_and_floor;
+      let shrink_length_sq = shrink_length * shrink_length;
+      potential = 0.5 * particle_spring_const_k * shrink_length_sq;
+    }
+
+    return potential;    
+  }
+  
+  calc_reaction_force(particle_pos_y,
+                      particle_radius,
+                      particle_spring_const_k,
+                      force) {
+    force.x = 0;
+    force.y = 0;  // zero set
+
+    let distance_between_particle_center_and_floor =
+      particle_pos_y - this.level_y;
+     
+    if (distance_between_particle_center_and_floor < particle_radius) {
+      let shrink_length =
+        particle_radius - distance_between_particle_center_and_floor;
+      let spring_force_amplitude =
+        particle_spring_const_k * shrink_length;
+      force.x = 0;
+      force.y = spring_force_amplitude; // upward
+    }     
+  }
+  
+  draw() {
+    stroke(0);
+    push();
+      window2.translate_origin();    
+      line(window2.mapx(x_coord_min), window2.mapy(this.level_y),
+           window2.mapx(x_coord_max), window2.mapy(this.level_y));
+    pop();
+  }
+}
+
+
+class RodElementParticle {
+  constructor() {
+    this.gcoord = new GeneralCoords();
+    this.gcoord_prev_step = new GeneralCoords();
+    this.delta_gcoord = new Array(4); // used in time integration
+    for (let i = 0; i < 4; i++) {
+      this.delta_gcoord[i] = new GeneralCoords();
+    }
+
+    this.is_on_surface = false;
+
+    this.spring_id_northeast = -1;
+    this.spring_id_east      = -1;
+    this.spring_id_southeast = -1;
+    this.spring_id_southwest = -1;
+    this.spring_id_west      = -1;
+    this.spring_id_northwest = -1;
+    //
+    //      NW     NE
+    //        \   /
+    //         \ /
+    //    W --- o --- E
+    //         / \
+    //        /   \
+    //      SW     SE
+  }
+}
+
+
+class RodElementSpring {
+  constructor() {
+    //    A vector object with direction and amplitude.
+    //    It direct from "foot" particle toward "head" particle.
+    //
+    this.gcoord = new GeneralCoords();
+
+    this.force = new DVector();   // spring's pull force + drag force
+                                  // The sign is positive for "pull" direction.
+    this.particle_id_head = -1;
+    this.particle_id_foot = -1;
+    this.natural_length = 0;
+    //
+    //            . head
+    //          ...
+    //        . . .
+    //      .  .  .
+    //        .   .
+    //       .
+    //      .
+    //     .
+    //    .
+    //   . foot
+  }
+}
+
+let rods = new Array(NUM_RODS);
+
+class Rod {
+  /*
+      A mass-damper-based model of a rod.
+      Particles are connected each other by springs.
+
+      Original Processing comments and diagrams omitted here only to keep
+      this conversion readable. They can be pasted back into this class
+      if needed.
+  */
+
+  get_particle_id_black(i, j) {
+    let id = i + j * this.nx_particle_black;
+    return id;
+  }
+
+  get_particle_id_white(i, j) {
+    let num_black_particles = this.nx_particle_black * this.ny_particle_black;
+    let id = num_black_particles + i + j * this.nx_particle_white;
+    return id;
+  }
+
+  initialize_particles() {
+    let rod_center_pos_x = (this.rod_tip_pos.x + this.rod_base_pos.x) / 2;
+    let rod_center_pos_y = (this.rod_tip_pos.y + this.rod_base_pos.y) / 2;
+    let rod_width_half  = this.rod_width  / 2;
+    let rod_height_half = this.rod_height / 2;
+
+    console.log("this.rod_tip_pos.x  = ", this.rod_tip_pos.x);
+    console.log("this.rod_base_pos.x = ", this.rod_base_pos.x);
+    console.log("this.rod_tip_pos.y  = ", this.rod_tip_pos.y);
+    console.log("this.rod_base_pos.y = ", this.rod_base_pos.y);
+
+    let angle_of_rod =
+      Math.PI / 2 -
+      Math.atan2(
+        this.rod_tip_pos.y - this.rod_base_pos.y,
+        this.rod_tip_pos.x - this.rod_base_pos.x
+      );
+
+    console.log("angle = ", angle_of_rod);
+
+    let cos_angle = Math.cos(angle_of_rod);
+    let sin_angle = Math.sin(angle_of_rod);
+
+    let counter_for_on_surface_particle = 0;
+    let pid = 0;
+
+    // Initialize black particles
+    for (let j = 0; j < this.ny_particle_black; j++) {
+      for (let i = 0; i < this.nx_particle_black; i++) {
+        let pos_x_in_local_coords =
+          -rod_width_half + this.triangle_edge_length * (i + 0.5);
+        let pos_y_in_local_coords =
+          -rod_height_half + this.triangle_height * 2 * j;
+
+        let pos_x =
+          cos_angle * pos_x_in_local_coords +
+          sin_angle * pos_y_in_local_coords;
+        let pos_y =
+          -sin_angle * pos_x_in_local_coords +
+          cos_angle * pos_y_in_local_coords;
+
+        pos_x += rod_center_pos_x;
+        pos_y += rod_center_pos_y;
+
+        let vel_x =
+          this.rod_base_vel.x +
+          ((this.rod_tip_vel.x - this.rod_base_vel.x) /
+            (this.ny_particle_black + this.ny_particle_white - 1)) * j;
+
+        let vel_y =
+          this.rod_base_vel.y +
+          ((this.rod_tip_vel.y - this.rod_base_vel.y) /
+            (this.ny_particle_black + this.ny_particle_white - 1)) * j;
+
+        this.particles[pid].gcoord =
+          new GeneralCoords(pos_x, pos_y, vel_x, vel_y);
+        this.particles[pid].gcoord_prev_step =
+          new GeneralCoords(pos_x, pos_y, vel_x, vel_y);
+
+        for (let k = 0; k < 4; k++) {
+          this.particles[pid].delta_gcoord[k] =
+            new GeneralCoords(0, 0, 0, 0);
+        }
+
+        this.particles[pid].spring_id_northeast = -1;
+        this.particles[pid].spring_id_east      = -1;
+        this.particles[pid].spring_id_southeast = -1;
+        this.particles[pid].spring_id_southwest = -1;
+        this.particles[pid].spring_id_west      = -1;
+        this.particles[pid].spring_id_northwest = -1;
+
+        if (
+          j === 0 ||
+          j === this.ny_particle_black - 1 ||
+          i === 0 ||
+          i === this.nx_particle_black - 1
+        ) {
+          this.particles[pid].is_on_surface = true;
+          this.on_surface_particle_id_list[counter_for_on_surface_particle] = pid;
+          counter_for_on_surface_particle += 1;
+        } else {
+          this.particles[pid].is_on_surface = false;
+        }
+
+        pid += 1;
+      }
+    }
+
+    // Initialize white particles
+    for (let j = 0; j < this.ny_particle_white; j++) {
+      for (let i = 0; i < this.nx_particle_white; i++) {
+        let pos_x_in_local_coords =
+          -rod_width_half + this.triangle_edge_length * i;
+        let pos_y_in_local_coords =
+          -rod_height_half + this.triangle_height * 2 * (j + 0.5);
+
+        let pos_x =
+          cos_angle * pos_x_in_local_coords +
+          sin_angle * pos_y_in_local_coords;
+        let pos_y =
+          -sin_angle * pos_x_in_local_coords +
+          cos_angle * pos_y_in_local_coords;
+
+        pos_x += rod_center_pos_x;
+        pos_y += rod_center_pos_y;
+
+        let vel_x =
+          this.rod_base_vel.x +
+          ((this.rod_tip_vel.x - this.rod_base_vel.x) /
+            (this.ny_particle_black + this.ny_particle_white - 1)) * j;
+
+        let vel_y =
+          this.rod_base_vel.y +
+          ((this.rod_tip_vel.y - this.rod_base_vel.y) /
+            (this.ny_particle_black + this.ny_particle_white - 1)) * j;
+
+        this.particles[pid].gcoord =
+          new GeneralCoords(pos_x, pos_y, vel_x, vel_y);
+        this.particles[pid].gcoord_prev_step =
+          new GeneralCoords(pos_x, pos_y, vel_x, vel_y);
+
+        for (let k = 0; k < 4; k++) {
+          this.particles[pid].delta_gcoord[k] =
+            new GeneralCoords(0, 0, 0, 0);
+        }
+
+        this.particles[pid].spring_id_northeast = -1;
+        this.particles[pid].spring_id_east      = -1;
+        this.particles[pid].spring_id_southeast = -1;
+        this.particles[pid].spring_id_southwest = -1;
+        this.particles[pid].spring_id_west      = -1;
+        this.particles[pid].spring_id_northwest = -1;
+
+        if (i === 0 || i === this.nx_particle_white - 1) {
+          this.particles[pid].is_on_surface = true;
+          this.on_surface_particle_id_list[counter_for_on_surface_particle] = pid;
+          counter_for_on_surface_particle += 1;
+        } else {
+          this.particles[pid].is_on_surface = false;
+        }
+
+        pid += 1;
+      }
+    }
+
+    this.num_of_on_surface_particles = counter_for_on_surface_particle;
+  }
+
+  initialize_springs() {
+    let arrow_x, arrow_y;
+    let vx = 0;
+    let vy = 0;
+
+    let sid = 0;
+    let particle_id_foot, particle_id_head;
+
+    // Spring type B
+    for (let j = 0; j < this.ny_particle_black; j++) {
+      for (let i = 0; i < this.nx_particle_black - 1; i++) {
+        arrow_x = this.triangle_edge_length;
+        arrow_y = 0.0;
+
+        this.springs[sid].gcoord =
+          new GeneralCoords(arrow_x, arrow_y, vx, vy);
+
+        particle_id_foot = this.get_particle_id_black(i, j);
+        particle_id_head = this.get_particle_id_black(i + 1, j);
+
+        this.springs[sid].particle_id_foot = particle_id_foot;
+        this.springs[sid].particle_id_head = particle_id_head;
+
+        this.particles[particle_id_foot].spring_id_east = sid;
+        this.particles[particle_id_head].spring_id_west = sid;
+
+        sid += 1;
+      }
+    }
+
+    // Spring type U
+    for (let j = 0; j < this.ny_particle_white; j++) {
+      for (let i = 0; i < this.nx_particle_black; i++) {
+        arrow_x = -0.5 * this.triangle_edge_length;
+        arrow_y = this.triangle_height;
+
+        this.springs[sid].gcoord =
+          new GeneralCoords(arrow_x, arrow_y, vx, vy);
+
+        particle_id_foot = this.get_particle_id_black(i, j);
+        particle_id_head = this.get_particle_id_white(i, j);
+
+        this.springs[sid].particle_id_foot = particle_id_foot;
+        this.springs[sid].particle_id_head = particle_id_head;
+
+        this.particles[particle_id_foot].spring_id_northwest = sid;
+        this.particles[particle_id_head].spring_id_southeast = sid;
+
+        sid += 1;
+
+        arrow_x = +0.5 * this.triangle_edge_length;
+        arrow_y = this.triangle_height;
+
+        this.springs[sid].gcoord =
+          new GeneralCoords(arrow_x, arrow_y, vx, vy);
+
+        particle_id_foot = this.get_particle_id_black(i, j);
+        particle_id_head = this.get_particle_id_white(i + 1, j);
+
+        this.springs[sid].particle_id_foot = particle_id_foot;
+        this.springs[sid].particle_id_head = particle_id_head;
+
+        this.particles[particle_id_foot].spring_id_northeast = sid;
+        this.particles[particle_id_head].spring_id_southwest = sid;
+
+        sid += 1;
+      }
+    }
+
+    // Spring type W
+    for (let j = 0; j < this.ny_particle_white; j++) {
+      for (let i = 0; i < this.nx_particle_white - 1; i++) {
+        arrow_x = this.triangle_edge_length;
+        arrow_y = 0;
+
+        this.springs[sid].gcoord =
+          new GeneralCoords(arrow_x, arrow_y, vx, vy);
+
+        particle_id_foot = this.get_particle_id_white(i, j);
+        particle_id_head = this.get_particle_id_white(i + 1, j);
+
+        this.springs[sid].particle_id_foot = particle_id_foot;
+        this.springs[sid].particle_id_head = particle_id_head;
+
+        this.particles[particle_id_foot].spring_id_east = sid;
+        this.particles[particle_id_head].spring_id_west = sid;
+
+        sid += 1;
+      }
+    }
+
+    // Spring type V
+    for (let j = 0; j < this.ny_particle_white; j++) {
+      for (let i = 0; i < this.nx_particle_white; i++) {
+        arrow_y = this.triangle_height;
+
+        if (i < this.nx_particle_white - 1) {
+          arrow_x = +0.5 * this.triangle_edge_length;
+
+          this.springs[sid].gcoord =
+            new GeneralCoords(arrow_x, arrow_y, vx, vy);
+
+          particle_id_foot = this.get_particle_id_white(i, j);
+          particle_id_head = this.get_particle_id_black(i, j + 1);
+
+          this.springs[sid].particle_id_foot = particle_id_foot;
+          this.springs[sid].particle_id_head = particle_id_head;
+
+          this.particles[particle_id_foot].spring_id_northeast = sid;
+          this.particles[particle_id_head].spring_id_southwest = sid;
+
+          sid += 1;
+        }
+
+        if (i > 0) {
+          arrow_x = -0.5 * this.triangle_edge_length;
+
+          this.springs[sid].gcoord =
+            new GeneralCoords(arrow_x, arrow_y, vx, vy);
+
+          particle_id_foot = this.get_particle_id_white(i, j);
+          particle_id_head = this.get_particle_id_black(i - 1, j + 1);
+
+          this.springs[sid].particle_id_foot = particle_id_foot;
+          this.springs[sid].particle_id_head = particle_id_head;
+
+          this.particles[particle_id_foot].spring_id_northwest = sid;
+          this.particles[particle_id_head].spring_id_southeast = sid;
+
+          sid += 1;
+        }
+      }
+    }
+  }
+
+  constructor(
+    rod_id,
+    rod_base_pos,
+    rod_tip_pos,
+    rod_base_vel,
+    rod_tip_vel,
+    mass,
+    rod_color,
+    spring_const_k,
+    particle_inner_spring_const_k_for_collision,
+    nx_particle_white,
+    ny_particle_total
+  ) {
+    this.rod_id = rod_id;
+
+    // Memory allocation for particles
+    this.nx_particle_black = nx_particle_white - 1;
+    this.ny_particle_black = Math.floor((ny_particle_total + 1) / 2);
+    this.nx_particle_white = nx_particle_white;
+    this.ny_particle_white = this.ny_particle_black - 1;
+
+    let num_particles_black =
+      this.nx_particle_black * this.ny_particle_black;
+    let num_particles_white =
+      this.nx_particle_white * this.ny_particle_white;
+
+    this.num_particles = num_particles_black + num_particles_white;
+
+    this.particles = new Array(this.num_particles);
+    this.on_surface_particle_id_list = new Array(this.num_particles);
+
+    for (let i = 0; i < this.num_particles; i++) {
+      this.particles[i] = new RodElementParticle();
+      this.particles[i].delta_gcoord = new Array(4);
+      for (let k = 0; k < 4; k++) {
+        this.particles[i].delta_gcoord[k] = new GeneralCoords();
+      }
+      this.on_surface_particle_id_list[i] = -1;
+    }
+
+    // Memory allocation for springs
+    let num_springs_type_b =
+      (this.nx_particle_black - 1) * this.ny_particle_black;
+    let num_springs_type_w =
+      (this.nx_particle_white - 1) * this.ny_particle_white;
+    let num_springs_type_u =
+      2 * this.nx_particle_black * this.ny_particle_white;
+    let num_springs_type_v =
+      2 * this.nx_particle_black * this.ny_particle_white;
+
+    this.num_springs =
+      num_springs_type_b +
+      num_springs_type_w +
+      num_springs_type_u +
+      num_springs_type_v;
+
+    this.springs = new Array(this.num_springs);
+
+    for (let s = 0; s < this.num_springs; s++) {
+      this.springs[s] = new RodElementSpring();
+    }
+
+    // Mass and other parameters
+    this.mass = mass;
+    this.mass_of_a_particle = mass / this.num_particles;
+    this.spring_const_k = spring_const_k;
+    this.particle_inner_spring_const_k_for_collision =
+      particle_inner_spring_const_k_for_collision;
+
+    let delta_x = rod_tip_pos.x - rod_base_pos.x;
+    let delta_y = rod_tip_pos.y - rod_base_pos.y;
+
+    this.rod_tip_pos  = new DVector(rod_tip_pos.x,  rod_tip_pos.y);
+    this.rod_base_pos = new DVector(rod_base_pos.x, rod_base_pos.y);
+    this.rod_tip_vel  = new DVector(rod_tip_vel.x,  rod_tip_vel.y);
+    this.rod_base_vel = new DVector(rod_base_vel.x, rod_base_vel.y);
+
+    this.rod_height = Math.sqrt(delta_x * delta_x + delta_y * delta_y);
+    this.triangle_height =
+      this.rod_height / (2 * (this.ny_particle_black - 1));
+    this.triangle_edge_length =
+      this.triangle_height * 2.0 / Math.sqrt(3.0);
+    this.rod_width =
+      this.triangle_edge_length * (this.nx_particle_white - 1);
+
+    this.rod_color = rod_color;
+    this.particle_radius_used_for_collision =
+      this.triangle_edge_length / 2;
+
+    this.initialize_particles();
+    this.initialize_springs();
+    this.set_springs_natural_length();
+    this.update_springs();
+  }
+
+  get_max_velocity_amplitude() {
+    let vel_amp_max = 0.0;
+
+    for (let i = 0; i < this.num_particles; i++) {
+      let vx = this.particles[i].gcoord.vx;
+      let vy = this.particles[i].gcoord.vy;
+      let vel_amp = Math.sqrt(vx * vx + vy * vy);
+
+      if (vel_amp > vel_amp_max) {
+        vel_amp_max = vel_amp;
+      }
+    }
+
+    return vel_amp_max;
+  }
+
+    update_springs() {
+    this.update_springs_gcoords();
+    this.update_springs_forces();
+  }
+
+  update_springs_gcoords() {
+    for (let s = 0; s < this.num_springs; s++) {
+      let pid_foot = this.springs[s].particle_id_foot;
+      let pid_head = this.springs[s].particle_id_head;
+
+      let pos_diff_x =
+        this.particles[pid_head].gcoord.x -
+        this.particles[pid_foot].gcoord.x;
+
+      let pos_diff_y =
+        this.particles[pid_head].gcoord.y -
+        this.particles[pid_foot].gcoord.y;
+
+      let vel_diff_x =
+        this.particles[pid_head].gcoord.vx -
+        this.particles[pid_foot].gcoord.vx;
+
+      let vel_diff_y =
+        this.particles[pid_head].gcoord.vy -
+        this.particles[pid_foot].gcoord.vy;
+
+      this.springs[s].gcoord =
+        new GeneralCoords(pos_diff_x, pos_diff_y, vel_diff_x, vel_diff_y);
+    }
+  }
+
+  set_springs_natural_length() {
+    for (let s = 0; s < this.num_springs; s++) {
+      let pid_foot = this.springs[s].particle_id_foot;
+      let pid_head = this.springs[s].particle_id_head;
+
+      let delta_x =
+        this.particles[pid_head].gcoord.x -
+        this.particles[pid_foot].gcoord.x;
+
+      let delta_y =
+        this.particles[pid_head].gcoord.y -
+        this.particles[pid_foot].gcoord.y;
+
+      this.springs[s].natural_length =
+        Math.sqrt(delta_x * delta_x + delta_y * delta_y);
+    }
+  }
+
+  calc_spring_damper_force(
+    arrow_x_normalized,
+    arrow_y_normalized,
+    spring_vx,
+    spring_vy,
+    damper_force
+  ) {
+    let spring_vel_amplitude =
+      Math.sqrt(spring_vx * spring_vx + spring_vy * spring_vy);
+
+    let damper_force_amplitude =
+      SPRING_DAMPER_FACTOR * spring_vel_amplitude;
+
+    damper_force.x = damper_force_amplitude * arrow_x_normalized;
+    damper_force.y = damper_force_amplitude * arrow_y_normalized;
+
+    let inner_product =
+      arrow_x_normalized * spring_vx +
+      arrow_y_normalized * spring_vy;
+
+    let sign_of_expansion_or_contraction;
+
+    if (inner_product >= 0) {
+      sign_of_expansion_or_contraction = 1;
+    } else {
+      sign_of_expansion_or_contraction = -1;
+    }
+
+    return sign_of_expansion_or_contraction;
+  }
+
+  update_springs_forces() {
+    // zero reset
+    for (let s = 0; s < this.num_springs; s++) {
+      this.springs[s].force = new DVector(0, 0);
+    }
+
+    let spring_damper_force = new DVector(0, 0);
+
+    for (let s = 0; s < this.num_springs; s++) {
+      let arrow_x = this.springs[s].gcoord.x;
+      let arrow_y = this.springs[s].gcoord.y;
+
+      let arrow_length =
+        Math.sqrt(arrow_x * arrow_x + arrow_y * arrow_y);
+
+      let spring_extension =
+        arrow_length - this.springs[s].natural_length;
+
+      let pull_force_amplitude =
+        this.spring_const_k * spring_extension;
+
+      let arrow_x_normalized = arrow_x / arrow_length;
+      let arrow_y_normalized = arrow_y / arrow_length;
+
+      this.springs[s].force.x =
+        pull_force_amplitude * arrow_x_normalized;
+
+      this.springs[s].force.y =
+        pull_force_amplitude * arrow_y_normalized;
+
+      // damper force
+      let sign = this.calc_spring_damper_force(
+        arrow_x_normalized,
+        arrow_y_normalized,
+        this.springs[s].gcoord.vx,
+        this.springs[s].gcoord.vy,
+        spring_damper_force
+      );
+
+      this.springs[s].force.x += sign * spring_damper_force.x;
+      this.springs[s].force.y += sign * spring_damper_force.y;
+    }
+  }
+
+  save_present_particles_gcoord() {
+    for (let i = 0; i < this.num_particles; i++) {
+      this.particles[i].gcoord_prev_step.x =
+        this.particles[i].gcoord.x;
+
+      this.particles[i].gcoord_prev_step.y =
+        this.particles[i].gcoord.y;
+
+      this.particles[i].gcoord_prev_step.vx =
+        this.particles[i].gcoord.vx;
+
+      this.particles[i].gcoord_prev_step.vy =
+        this.particles[i].gcoord.vy;
+    }
+  }
+
+  calc_spring_force(pid) {
+    /*
+       "spring_north_west" is an arrow object that applies
+       a "pull" force onto particle_B.
+    */
+
+    let force = new DVector(0, 0);
+
+    let spring_id_northwest = this.particles[pid].spring_id_northwest;
+    if (spring_id_northwest >= 0) {
+      force.x += this.springs[spring_id_northwest].force.x;
+      force.y += this.springs[spring_id_northwest].force.y;
+    }
+
+    let spring_id_northeast = this.particles[pid].spring_id_northeast;
+    if (spring_id_northeast >= 0) {
+      force.x += this.springs[spring_id_northeast].force.x;
+      force.y += this.springs[spring_id_northeast].force.y;
+    }
+
+    let spring_id_east = this.particles[pid].spring_id_east;
+    if (spring_id_east >= 0) {
+      force.x += this.springs[spring_id_east].force.x;
+      force.y += this.springs[spring_id_east].force.y;
+    }
+
+    let spring_id_southeast = this.particles[pid].spring_id_southeast;
+    if (spring_id_southeast >= 0) {
+      force.x -= this.springs[spring_id_southeast].force.x;
+      force.y -= this.springs[spring_id_southeast].force.y;
+    }
+
+    let spring_id_southwest = this.particles[pid].spring_id_southwest;
+    if (spring_id_southwest >= 0) {
+      force.x -= this.springs[spring_id_southwest].force.x;
+      force.y -= this.springs[spring_id_southwest].force.y;
+    }
+
+    let spring_id_west = this.particles[pid].spring_id_west;
+    if (spring_id_west >= 0) {
+      force.x -= this.springs[spring_id_west].force.x;
+      force.y -= this.springs[spring_id_west].force.y;
+    }
+
+    return force;
+  }
+
+  calc_reaction_force_from_floor_and_walls(pid) {
+    let force = new DVector(0, 0);
+
+    if (this.particles[pid].is_on_surface) {
+      floor.calc_reaction_force(
+        this.particles[pid].gcoord.y,
+        this.particle_radius_used_for_collision,
+        this.particle_inner_spring_const_k_for_collision,
+        force
+      );
+    }
+
+    return force;
+  }
+
+  calc_contact_force_with_other_rod(pid) {
+    let mutual_push_force_by_collision_x = 0;
+    let mutual_push_force_by_collision_y = 0;
+
+    if (this.particles[pid].is_on_surface) {
+      for (
+        let rod_id_of_other_rod = 0;
+        rod_id_of_other_rod < NUM_RODS;
+        rod_id_of_other_rod++
+      ) {
+        if (rod_id_of_other_rod === this.rod_id) {
+          continue;
+        }
+
+        for (
+          let s = 0;
+          s < rods[rod_id_of_other_rod].num_of_on_surface_particles;
+          s++
+        ) {
+          let surface_particle_id_of_other_rod =
+            rods[rod_id_of_other_rod].on_surface_particle_id_list[s];
+
+          let pos_x_other =
+            rods[rod_id_of_other_rod]
+              .particles[surface_particle_id_of_other_rod].gcoord.x;
+
+          let pos_y_other =
+            rods[rod_id_of_other_rod]
+              .particles[surface_particle_id_of_other_rod].gcoord.y;
+
+          let pos_x_myself = this.particles[pid].gcoord.x;
+          let pos_y_myself = this.particles[pid].gcoord.y;
+
+          let delta_x_from_myself_to_other =
+            pos_x_other - pos_x_myself;
+
+          let delta_y_from_myself_to_other =
+            pos_y_other - pos_y_myself;
+
+          let delta_x_sq =
+            delta_x_from_myself_to_other *
+            delta_x_from_myself_to_other;
+
+          let delta_y_sq =
+            delta_y_from_myself_to_other *
+            delta_y_from_myself_to_other;
+
+          let distance =
+            Math.sqrt(delta_x_sq + delta_y_sq);
+
+          let vel_x_other =
+            rods[rod_id_of_other_rod]
+              .particles[surface_particle_id_of_other_rod].gcoord.vx;
+
+          let vel_y_other =
+            rods[rod_id_of_other_rod]
+              .particles[surface_particle_id_of_other_rod].gcoord.vy;
+
+          let vel_x_myself = this.particles[pid].gcoord.vx;
+          let vel_y_myself = this.particles[pid].gcoord.vy;
+
+          let delta_vx_from_myself_to_other =
+            vel_x_other - vel_x_myself;
+
+          let delta_vy_from_myself_to_other =
+            vel_y_other - vel_y_myself;
+
+          let delta_vx_sq =
+            delta_vx_from_myself_to_other *
+            delta_vx_from_myself_to_other;
+
+          let delta_vy_sq =
+            delta_vy_from_myself_to_other *
+            delta_vy_from_myself_to_other;
+
+          let delta_vel_amplitude =
+            Math.sqrt(delta_vx_sq + delta_vy_sq);
+
+          let inner_product =
+            delta_x_from_myself_to_other *
+              delta_vx_from_myself_to_other +
+            delta_y_from_myself_to_other *
+              delta_vy_from_myself_to_other;
+
+          let sign_of_expansion_or_contraction;
+
+          if (inner_product >= 0) {
+            sign_of_expansion_or_contraction = 1;
+          } else {
+            sign_of_expansion_or_contraction = -1;
+          }
+
+          let particle_radius_other =
+            rods[rod_id_of_other_rod]
+              .particle_radius_used_for_collision;
+
+          let particle_radius_myself =
+            this.particle_radius_used_for_collision;
+
+          let particle_radius_sum =
+            particle_radius_other + particle_radius_myself;
+
+          if (distance < particle_radius_sum && distance > 0) {
+            let spring_const_k_other =
+              rods[rod_id_of_other_rod]
+                .particle_inner_spring_const_k_for_collision;
+
+            let spring_const_k_myself =
+              this.particle_inner_spring_const_k_for_collision;
+
+            let spring_const_k_mean =
+              (spring_const_k_other + spring_const_k_myself) / 2;
+
+            let spring_extraction_length =
+              particle_radius_sum - distance;
+
+            let spring_force_amplitude =
+              spring_const_k_mean * spring_extraction_length;
+
+            let unit_vector_x_from_myself_to_other =
+              delta_x_from_myself_to_other / distance;
+
+            let unit_vector_y_from_myself_to_other =
+              delta_y_from_myself_to_other / distance;
+
+            let spring_force_from_other_x =
+              -spring_force_amplitude *
+              unit_vector_x_from_myself_to_other;
+
+            let spring_force_from_other_y =
+              -spring_force_amplitude *
+              unit_vector_y_from_myself_to_other;
+
+            let damper_force_amplitude =
+              SPRING_DAMPER_FACTOR * delta_vel_amplitude;
+
+            let damper_force_x =
+              sign_of_expansion_or_contraction *
+              damper_force_amplitude *
+              unit_vector_x_from_myself_to_other;
+
+            let damper_force_y =
+              sign_of_expansion_or_contraction *
+              damper_force_amplitude *
+              unit_vector_y_from_myself_to_other;
+
+            mutual_push_force_by_collision_x +=
+              spring_force_from_other_x + damper_force_x;
+
+            mutual_push_force_by_collision_y +=
+              spring_force_from_other_y + damper_force_y;
+          }
+        }
+      }
+    }
+
+    let total_force =
+      new DVector(
+        mutual_push_force_by_collision_x,
+        mutual_push_force_by_collision_y
+      );
+
+    return total_force;
+  }
+
+  equation_of_motion(rk_nth) {
+    for (let i = 0; i < this.num_particles; i++) {
+      let spring_force = this.calc_spring_force(i);
+
+      let gravity_force = new DVector(0, 0);
+      gravity_force.x = 0;
+      gravity_force.y =
+        -this.mass_of_a_particle * GRAVITY_ACCELERATION;
+
+      let collision_force =
+        this.calc_reaction_force_from_floor_and_walls(i);
+
+      let contact_force =
+        this.calc_contact_force_with_other_rod(i);
+
+      let total_force = new DVector(0, 0);
+      total_force.x =
+        spring_force.x +
+        gravity_force.x +
+        collision_force.x +
+        contact_force.x;
+
+      total_force.y =
+        spring_force.y +
+        gravity_force.y +
+        collision_force.y +
+        contact_force.y;
+
+      let vx = this.particles[i].gcoord.vx;
+      let vy = this.particles[i].gcoord.vy;
+
+      // Equation of motion
+      let dtm = simulation_dt / this.mass_of_a_particle;
+      let nth = rk_nth - 1;
+
+      this.particles[i].delta_gcoord[nth].x =
+        vx * simulation_dt;
+
+      this.particles[i].delta_gcoord[nth].vx =
+        total_force.x * dtm;
+
+      this.particles[i].delta_gcoord[nth].y =
+        vy * simulation_dt;
+
+      this.particles[i].delta_gcoord[nth].vy =
+        total_force.y * dtm;
+    }
+  }
+
+  runge_kutta_advance(rk_nth) {
+    switch (rk_nth) {
+      case 1:
+        this.runge_kutta_advance_element(rk_nth, 0.5);
+        break;
+
+      case 2:
+        this.runge_kutta_advance_element(rk_nth, 0.5);
+        break;
+
+      case 3:
+        this.runge_kutta_advance_element(rk_nth, 1.0);
+        break;
+
+      case 4:
+        this.runge_kutta_advance_final();
+        break;
+    }
+  }
+
+  runge_kutta_advance_element(rk_nth, factor) {
+    let nth = rk_nth - 1;
+
+    for (let i = 0; i < this.num_particles; i++) {
+      this.particles[i].gcoord.x =
+        this.particles[i].gcoord_prev_step.x +
+        factor * this.particles[i].delta_gcoord[nth].x;
+
+      this.particles[i].gcoord.y =
+        this.particles[i].gcoord_prev_step.y +
+        factor * this.particles[i].delta_gcoord[nth].y;
+
+      this.particles[i].gcoord.vx =
+        this.particles[i].gcoord_prev_step.vx +
+        factor * this.particles[i].delta_gcoord[nth].vx;
+
+      this.particles[i].gcoord.vy =
+        this.particles[i].gcoord_prev_step.vy +
+        factor * this.particles[i].delta_gcoord[nth].vy;
+    }
+  }
+
+  runge_kutta_advance_final() {
+    const ONE_SIXTH = 1.0 / 6.0;
+    const ONE_THIRD = 1.0 / 3.0;
+
+    for (let i = 0; i < this.num_particles; i++) {
+      this.particles[i].gcoord.x =
+        this.particles[i].gcoord_prev_step.x +
+        ONE_SIXTH * this.particles[i].delta_gcoord[0].x +
+        ONE_THIRD * this.particles[i].delta_gcoord[1].x +
+        ONE_THIRD * this.particles[i].delta_gcoord[2].x +
+        ONE_SIXTH * this.particles[i].delta_gcoord[3].x;
+
+      this.particles[i].gcoord.y =
+        this.particles[i].gcoord_prev_step.y +
+        ONE_SIXTH * this.particles[i].delta_gcoord[0].y +
+        ONE_THIRD * this.particles[i].delta_gcoord[1].y +
+        ONE_THIRD * this.particles[i].delta_gcoord[2].y +
+        ONE_SIXTH * this.particles[i].delta_gcoord[3].y;
+
+      this.particles[i].gcoord.vx =
+        this.particles[i].gcoord_prev_step.vx +
+        ONE_SIXTH * this.particles[i].delta_gcoord[0].vx +
+        ONE_THIRD * this.particles[i].delta_gcoord[1].vx +
+        ONE_THIRD * this.particles[i].delta_gcoord[2].vx +
+        ONE_SIXTH * this.particles[i].delta_gcoord[3].vx;
+
+      this.particles[i].gcoord.vy =
+        this.particles[i].gcoord_prev_step.vy +
+        ONE_SIXTH * this.particles[i].delta_gcoord[0].vy +
+        ONE_THIRD * this.particles[i].delta_gcoord[1].vy +
+        ONE_THIRD * this.particles[i].delta_gcoord[2].vy +
+        ONE_SIXTH * this.particles[i].delta_gcoord[3].vy;
+    }
+  }
+
+  get_total_energy() {
+    return this.get_kinetic_energy() + this.get_potential_energy();
+  }
+
+  get_kinetic_energy() {
+    let sum = 0;
+
+    for (let i = 0; i < this.num_particles; i++) {
+      let vx = this.particles[i].gcoord.vx;
+      let vy = this.particles[i].gcoord.vy;
+      sum += vx * vx + vy * vy;
+    }
+
+    return 0.5 * this.mass_of_a_particle * sum;
+  }
+
+  get_potential_energy() {
+    let sum = 0;
+
+    for (let s = 0; s < this.num_springs; s++) {
+      let arrow_x = this.springs[s].gcoord.x;
+      let arrow_y = this.springs[s].gcoord.y;
+
+      let arrow_length =
+        Math.sqrt(arrow_x * arrow_x + arrow_y * arrow_y);
+
+      let spring_extension =
+        arrow_length - this.springs[s].natural_length;
+
+      let spring_extension_sq =
+        spring_extension * spring_extension;
+
+      sum += spring_extension_sq;
+    }
+
+    let spring_potential =
+      0.5 * this.spring_const_k * sum;
+
+    sum = 0;
+
+    for (let i = 0; i < this.num_particles; i++) {
+      sum += this.particles[i].gcoord.y;
+    }
+
+    let gravity_potential =
+      this.mass_of_a_particle *
+      GRAVITY_ACCELERATION *
+      sum;
+
+    sum = 0;
+
+    for (let i = 0; i < this.num_particles; i++) {
+      if (this.particles[i].is_on_surface) {
+        let y = this.particles[i].gcoord.y;
+
+        sum += floor.calc_potential_energy(
+          y,
+          this.particle_radius_used_for_collision,
+          this.particle_inner_spring_const_k_for_collision
+        );
+      }
+    }
+
+    let collision_potential = sum;
+
+    return spring_potential + gravity_potential + collision_potential;
+  }
+
+  draw() {
+    this.draw_rod_springs();
+    this.draw_rod_particles();
+  }
+
+  draw_rod_springs() {
+    stroke(50, 120, 120);
+
+    push();
+    window2.translate_origin();
+
+    for (let s = 0; s < this.num_springs; s++) {
+      let pid_foot = this.springs[s].particle_id_foot;
+      let x0 = this.particles[pid_foot].gcoord.x;
+      let y0 = this.particles[pid_foot].gcoord.y;
+
+      let pid_head = this.springs[s].particle_id_head;
+      let x1 = this.particles[pid_head].gcoord.x;
+      let y1 = this.particles[pid_head].gcoord.y;
+
+      line(
+        window2.mapx(x0),
+        window2.mapy(y0),
+        window2.mapx(x1),
+        window2.mapy(y1)
+      );
+    }
+
+    pop();
+  }
+
+  draw_rod_particles() {
+    fill(this.rod_color);
+
+    push();
+    window2.translate_origin();
+
+    for (let i = 0; i < this.num_particles; i++) {
+      ellipse(
+        window2.mapx(this.particles[i].gcoord.x),
+        window2.mapy(this.particles[i].gcoord.y),
+        window2.mapx(2*this.particle_radius_used_for_collision),
+        window2.mapy(2*this.particle_radius_used_for_collision)
+      );
+    }
+
+    pop();
+  }
+}
+
+let window2;
+
+class Window2 {
+  constructor(xmin, ymin, xmax, ymax) {
+    this.xmin = xmin;
+    this.ymin = ymin;
+    this.xmax = xmax;
+    this.ymax = ymax;
+
+    this.origin_translate_weight_x = 0.5;
+    this.origin_translate_weight_y = 0.5;
+  }
+
+  background(grayOrR, g, b) {
+    noStroke();
+
+    if (g === undefined || b === undefined) {
+      fill(grayOrR);
+    } else {
+      fill(grayOrR, g, b);
+    }
+
+    rect(
+      this.xmin,
+      this.ymin,
+      this.xmax - this.xmin,
+      this.ymax - this.ymin
+    );
+  }
+
+  frame(gray) {
+    stroke(gray);
+    noFill();
+    rect(
+      this.xmin,
+      this.ymin,
+      this.xmax - this.xmin,
+      this.ymax - this.ymin
+    );
+  }
+
+  translate_origin() {
+    let wx0 = this.origin_translate_weight_x;
+    let wx1 = 1 - wx0;
+    let wy0 = this.origin_translate_weight_y;
+    let wy1 = 1 - wy0;
+
+    translate(
+      wx0 * this.xmin + wx1 * this.xmax,
+      wy0 * this.ymin + wy1 * this.ymax
+    );
+  }
+
+  set_origin_translate_weight(wx, wy) {
+    this.origin_translate_weight_x = wx;
+    this.origin_translate_weight_y = wy;
+  }
+
+  mapx(x) {
+    let scale =
+      (this.xmax - this.xmin) / (x_coord_max - x_coord_min);
+    return x * scale;
+  }
+
+  mapy(y) {
+    let scale =
+      (this.xmax - this.xmin) / (x_coord_max - x_coord_min);
+    return -y * scale;
+  }
+
+  draw_axes_x_y() {
+    push();
+      this.translate_origin();
+      stroke(100, 100, 100);
+      line(this.mapx(x_coord_min), 0, this.mapx(x_coord_max), 0);
+      line(0, this.mapx(x_coord_min), 0, this.mapx(x_coord_max));
+    pop();
+  }
+
+  label_x_axis(msg) {
+    push();
+      this.translate_origin();
+      fill(0, 0, 0);
+      textAlign(RIGHT);
+      text(msg, this.mapx(x_coord_max), -6);
+    pop();
+  }
+
+  label_y_axis(msg) {
+    push();
+      this.translate_origin();
+      fill(0, 0, 0);
+      textAlign(CENTER);
+      text(msg, this.mapx(0), -this.mapx(x_coord_max) - 6);
+    pop();
+  }
+}
+
+
+class Header {
+  erase(gray) {
+    fill(gray);
+    stroke(gray);
+    rect(0, 0, width, VERTICAL_MARGIN);
+  }
+
+  title(msg, rlc) {
+    // rlc = RIGHT or LEFT or CENTER
+    noStroke();
+
+    push();
+      fill(0, 0, 0);
+      textAlign(rlc);
+      text(msg, width / 2, VERTICAL_MARGIN / 2);
+    pop();
+  }
+}
+
+
+class Footer {
+  erase(gray) {
+    noStroke();
+    fill(gray);
+    rect(0, height - VERTICAL_MARGIN, width, VERTICAL_MARGIN);
+  }
+
+  title(msg, rlc) {
+    // rlc = RIGHT or LEFT or CENTER
+    noStroke();
+
+    push();
+      fill(0, 0, 0);
+      textAlign(rlc);
+      text(
+        msg,
+        0,
+        height - VERTICAL_MARGIN + textWidth(" "),
+        width,
+        VERTICAL_MARGIN
+      );
+    pop();
+  }
+}
+
+
+let header = new Header();
+let footer = new Footer();
+
+
+function setup() {
+  createCanvas(1000, 1000);
+  background(255);
+  frameRate(60);
+
+  let window_width = width - 2 * HORIZONTAL_MARGIN;
+  let x0l = HORIZONTAL_MARGIN;
+  let x0r = x0l + window_width;
+
+  let y1 = VERTICAL_MARGIN;
+  let y2 = height - VERTICAL_MARGIN;
+
+  window2 = new Window2(x0l, y1, x0r, y2);
+  window2.set_origin_translate_weight(0.5, 0.5);
+
+  header.title("Rod simulation. \nType u/d to speed up/down.", CENTER);
+
+  let rod_mass = 1.0;
+  let rod_color = color(0, 32, 255);
+
+  let rod_base_pos = new DVector(0.0, 0.0);
+  let rod_tip_pos  = new DVector(0.0, 1.0);
+  let rod_base_vel = new DVector(0.0, 0.0);
+  let rod_tip_vel  = new DVector(0.0, 0.0);
+
+  let rod_spring_const_k = 1.0e4;
+  let rod_particle_inner_spring_const_k_for_collision =
+    rod_spring_const_k * 1;
+
+  let rod_nx_particle_white = 5;
+  let rod_ny_particle_total = 25;
+
+  rods[0] = new Rod(
+    0,
+    rod_base_pos,
+    rod_tip_pos,
+    rod_base_vel,
+    rod_tip_vel,
+    rod_mass,
+    rod_color,
+    rod_spring_const_k,
+    rod_particle_inner_spring_const_k_for_collision,
+    rod_nx_particle_white,
+    rod_ny_particle_total
+  );
+
+  floor = new Floor(FLOOR_LEVEL_Y);
+
+  set_time_increment_dt();
+}
+
+
+function set_time_increment_dt() {
+  let spring_omega_rod =
+    Math.sqrt(rods[0].spring_const_k / rods[0].mass_of_a_particle);
+
+  let spring_period_rod =
+    (2 * Math.PI) / spring_omega_rod;
+
+  let dt_rod =
+    spring_period_rod * 0.02;
+
+  let spring_omega_of_rod_particle_inner_spring =
+    Math.sqrt(
+      rods[0].particle_inner_spring_const_k_for_collision
+      / rods[0].mass_of_a_particle
+    );
+
+  let spring_period_of_rod_particle_inner_spring =
+    (2 * Math.PI) / spring_omega_of_rod_particle_inner_spring;
+
+  let dt_rod_particle_inner_spring =
+    spring_period_of_rod_particle_inner_spring * 0.02;
+
+  let lowest_y = 1.0e30;
+
+  for (let i = 0; i < rods[0].num_particles; i++) {
+    lowest_y = Math.min(lowest_y, rods[0].particles[i].gcoord.y);
+  }
+
+  let fall_distance = lowest_y - FLOOR_LEVEL_Y;
+  fall_distance = Math.max(fall_distance, 1.0e-12);
+
+  let free_fall_velocity =
+    Math.sqrt(2 * GRAVITY_ACCELERATION * fall_distance);
+
+  let dt_free_fall =
+    rods[0].particle_radius_used_for_collision
+    / free_fall_velocity
+    * 0.005;
+
+  simulation_dt =
+    Math.min(dt_rod, dt_rod_particle_inner_spring);
+
+  simulation_dt =
+    Math.min(simulation_dt, dt_free_fall);
+
+  console.log("dt = ", simulation_dt);
+}
+
+function time_integrate() {
+  for (let n = 0; n < NUM_RODS; n++) {
+    rods[n].save_present_particles_gcoord();
+  }
+
+  for (let rk_nth = 1; rk_nth <= 4; rk_nth++) {
+    for (let n = 0; n < NUM_RODS; n++) {
+      rods[n].equation_of_motion(rk_nth);
+    }
+
+    for (let n = 0; n < NUM_RODS; n++) {
+      rods[n].runge_kutta_advance(rk_nth);
+    }
+
+    for (let n = 0; n < NUM_RODS; n++) {
+      rods[n].update_springs();
+    }
+  }
+}
+
+
+function draw() {
+  if (running_state_toggle) {
+    for (let icnt = 0; icnt < play_speed; icnt++) {
+      time_integrate();
+      simulation_time += simulation_dt;
+      simulation_step += 1;
+    }
+  }
+
+  background(255);
+
+  window2.background(255, 255, 240);
+
+  floor.draw();
+
+  for (let n = 0; n < NUM_RODS; n++) {
+    rods[n].draw();
+  }
+
+  header.erase(255);
+  header.title("Rod simulation. \nType u/d to speed up/down.", CENTER);
+
+  let total_energy = 0;
+  for (let n = 0; n < NUM_RODS; n++) {
+    total_energy += rods[n].get_total_energy();
+  }
+
+  let str = "t = " + nf(simulation_time, 6, 3);
+  str += " (step = " + nf(simulation_step, 9) + ")\n";
+  str += "energy = " + nf(total_energy, 4, 3);
+
+  footer.erase(255);
+  footer.title(str, CENTER);
+}
+
+
+function mousePressed() {
+  running_state_toggle = !running_state_toggle;
+}
+
+
+function keyReleased() {
+  switch (key) {
+    case "s":
+      running_state_toggle = !running_state_toggle;
+      break;
+
+    case "u":
+      play_speed *= 10;
+      break;
+
+    case "d":
+      play_speed = Math.floor(play_speed / 10);
+      if (play_speed <= 0) play_speed = 1;
+      break;
+  }
+}
